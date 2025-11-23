@@ -1,10 +1,20 @@
 # Heatwave-ABM: Agent-Based Heatwave Simulation with LLM Hooks
+
+
+# Process Step
+
 pip install --upgrade google-genai
 
-export  GEMINI_API_KEY=AIzaSyDQv5uf9r9UWNe07R2lCizKPD9GsPeh3ck
-https://chatgpt.com/c/69223684-0188-8328-8fd0-f186d105ad86
 
+export  GEMINI_API_KEY=xxx
+ref to:  https://chatgpt.com/c/69223684-0188-8328-8fd0-f186d105ad86
 
+#  --no-llm   --silent     # turn on if needed  
+python main.py   --agents-path    data/agents.csv   --weather-path data/weather.csv    --no-llm       
+
+python visualize_results.py
+
+# Introduction
 
 This project simulates how **individual people (agents)** experience and respond to a **heatwave**, and how:
 

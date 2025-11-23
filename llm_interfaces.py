@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List, Dict, Any
 import json
 import os
+import re
 
 from agents import Agent, age_to_group, disease_to_group
 from environment import EnvironmentState
@@ -14,7 +15,25 @@ PROVIDER = "gemini"  # "gemini", "openai", "qwen", or "none"
 
 LLM_VERBOSE = True   # print prompts and responses
 
+# Does this provider actually correspond to a real LLM backend?
 USE_REAL_LLM = PROVIDER in ("gemini", "openai", "qwen")
+
+# Global runtime switch controlled by CLI (--no-llm)
+# If False, ALL LLM features should be disabled, regardless of PROVIDER.
+GLOBAL_LLM_ENABLED = True
+
+
+def set_global_llm_enabled(enabled: bool) -> None:
+    """
+    Called from main.py (or tests) to globally enable/disable LLM usage.
+
+    Example in main.py:
+        from llm_interfaces import set_global_llm_enabled
+        set_global_llm_enabled(not args.no_llm)
+    """
+    global GLOBAL_LLM_ENABLED
+    GLOBAL_LLM_ENABLED = bool(enabled)
+    print(f"[LLM] Global LLM enabled set to {GLOBAL_LLM_ENABLED}")
 
 
 # ---- Gemini config ----
@@ -43,11 +62,13 @@ QWEN_MODEL = "qwen-max"
 def call_llm_api(prompt: str, tag: str = "") -> str:
     """
     Core LLM call. Uses the provider selected by PROVIDER.
+    Respects GLOBAL_LLM_ENABLED so that a single flag controls ALL LLM use.
     """
-    if not USE_REAL_LLM:
+    if not USE_REAL_LLM or not GLOBAL_LLM_ENABLED:
         raise RuntimeError(
-            "call_llm_api called but PROVIDER='none'. "
-            "Set PROVIDER to 'gemini', 'openai', or 'qwen' in llm_interfaces.py."
+            "LLM call requested but LLM is disabled. "
+            "Either PROVIDER='none' or GLOBAL_LLM_ENABLED=False. "
+            "If you are using CLI, check the --no-llm flag."
         )
 
     if PROVIDER == "gemini":
@@ -135,6 +156,7 @@ def _call_gemini(prompt: str, tag: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set in environment.")
+
     client = genai.Client(api_key=api_key)
     model = GEMINI_MODEL
     provider = "GEMINI"
@@ -190,6 +212,30 @@ Return JSON ONLY:
 """.strip()
 
 
+def clean_llm_json(raw: str) -> str:
+    """
+    Clean common formatting noise from LLM responses:
+    - strips whitespace
+    - removes ```json ... ``` fences if present
+    """
+    if raw is None:
+        raise ValueError("Empty response from LLM")
+
+    text = raw.strip()
+    if not text:
+        raise ValueError("LLM returned an empty string")
+
+    # If the model wrapped it in ```json ... ``` or ``` ... ```
+    if text.startswith("```"):
+        # remove the first line (```json or ```):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        # remove a trailing ``` if present
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+    return text
+
+
 def parse_agent_decision(response: str) -> Dict[str, Any]:
     response = clean_llm_json(response)
     data = json.loads(response)
@@ -207,7 +253,8 @@ def parse_agent_decision(response: str) -> Dict[str, Any]:
 
 def build_personal_risk_prompt(agent: Agent, env: EnvironmentState) -> str:
     """
-    This is ALWAYS used (when USE_REAL_LLM=True) for each agent each day.
+    This is ALWAYS used (when GLOBAL_LLM_ENABLED=True and USE_REAL_LLM=True)
+    for each agent each day.
     """
     age_group_str = age_to_group(agent.age)
     disease_group_str = disease_to_group(agent.disease_name, agent.has_chronic_disease)
@@ -513,27 +560,7 @@ Return JSON ONLY like:
 """.strip()
 
 
-import re
-def clean_llm_json(raw: str) -> str:
-    if raw is None:
-        raise ValueError("Empty response from LLM")
-
-    text = raw.strip()
-    if not text:
-        raise ValueError("LLM returned an empty string")
-
-    # If the model wrapped it in ```json ... ``` or ``` ... ```
-    if text.startswith("```"):
-        # remove the first line (```json or ```):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        # remove a trailing ``` if present
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-    return text
-
 def parse_family_plan(response: str) -> Dict[int, Dict[str, Any]]:
-    # print("response = ", response)
     response = clean_llm_json(response)
     data = json.loads(response)   # Here to handle.
     out: Dict[int, Dict[str, Any]] = {}
@@ -644,13 +671,14 @@ def parse_weather_announcement(response: str) -> Dict[str, Any]:
 def llm_weather_announcement(env: EnvironmentState) -> Dict[str, Any]:
     """
     Optional global weather announcement (for logging / UI).
+    Respects GLOBAL_LLM_ENABLED, so if you pass --no-llm this won't be used.
     """
-    if USE_REAL_LLM:
+    if USE_REAL_LLM and GLOBAL_LLM_ENABLED:
         prompt = build_weather_broadcast_prompt(env)
         text = call_llm_api(prompt, tag=f"weather_day_{env.day}")
         return parse_weather_announcement(text)
 
-    # Heuristic fallback
+    # Heuristic fallback when LLM is disabled or not configured
     risk_multiplier = 1.0
     if env.temperature > 40 or env.humidity > 0.7:
         risk_multiplier = 1.3

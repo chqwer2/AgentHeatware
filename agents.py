@@ -185,6 +185,7 @@ class Agent:
 
     # ------------ STATE UPDATE ------------
 
+
     def update_state(
         self,
         env: EnvironmentState,
@@ -197,68 +198,166 @@ class Agent:
           - go_hospital
           - use_ac
           - target_outdoor_hours
+
+        Rules:
+        - If weather is COMFORTABLE (<= comfort_temp_max and <= comfort_humidity_max):
+            * no heat damage
+            * health & mental recover toward baseline, plus bonus
+        - If weather is HOT:
+            * heat damage depends on temperature, humidity, outdoor exposure
+            * water & AC strongly reduce damage
+            * hospital helps health & mental a bit
+        - If mental is very low, they can seek mental help and get a one-time boost.
         """
         drink_water = bool(action.get("drink_water", False))
         go_hospital = bool(action.get("go_hospital", False))
         use_ac = bool(action.get("use_ac", False))
         target_outdoor = float(action.get("target_outdoor_hours", self.outdoor_hours))
 
-        # Some jobs require minimum outdoor exposure
+        comfort_temp_max = params["comfort_temp_max"]
+        comfort_humidity_max = params["comfort_humidity_max"]
+        heat_temp = params["heat_temp"]
+        extreme_temp = params["extreme_temp"]
+
+        # Some jobs require minimum outdoor exposure (they can't fully stay inside)
         required_min_outdoor = 0.0
         if self.job in ("construction", "delivery", "farmer"):
             required_min_outdoor = min(4.0, self.outdoor_hours)
 
         outdoor_hours = max(target_outdoor, required_min_outdoor)
 
-        # Hydration dynamics
+        # ---------------- HYDRATION ----------------
         if drink_water:
             self.hydration = min(1.0, self.hydration + params["drink_hydration_boost"])
 
-        # baseline dehydration
+        # baseline dehydration each day
         self.hydration = max(0.0, self.hydration - params["baseline_dehydration"])
 
-        # Extra dehydration if outside a lot
-        if outdoor_hours > self.outdoor_hours * 0.8:
+        # extra dehydration if outside a lot in hot weather
+        if outdoor_hours > self.outdoor_hours * 0.8 and env.temperature > heat_temp:
             self.hydration = max(0.0, self.hydration - 0.1)
 
-        # Heat stress
-        temp_excess = max(0.0, env.temperature - params["base_safe_temp"])
-        hum_factor = 1.0 + env.humidity
-        exposure_factor = outdoor_hours / max(1.0, self.outdoor_hours)
-        raw_heat_stress = temp_excess * hum_factor * exposure_factor
-
-        # Cooling & hospital mitigation
-        cooling_factor = 0.5 if use_ac else 1.0
-        hospital_factor = params["hospital_relief_factor"] if go_hospital else 1.0
-        hydration_factor = 1.0 - 0.5 * self.hydration  # 0..1
-
-        effective_stress = (
-            raw_heat_stress
-            * cooling_factor
-            * hospital_factor
-            * (0.5 + hydration_factor / 2.0)
+        # ---------------- COMFORTABLE vs HEAT DAY ----------------
+        is_comfortable = (
+            env.temperature <= comfort_temp_max
+            and env.humidity <= comfort_humidity_max
         )
 
-        # Physical health damage
-        age_factor = 0.5 + (self.age / 100.0)
-        health_damage = params["health_sensitivity"] * effective_stress * age_factor
-        self.health = max(0.0, min(1.0, self.health - health_damage))
+        # ===== Comfortable day: no heat damage, only recovery =====
+        if is_comfortable:
+            # Physical health recovers toward baseline
+            if self.health < self.baseline_health:
+                self.health += params["health_recovery_rate"] * (self.baseline_health - self.health)
+                self.health += params["comfort_health_recovery_bonus"] * (self.baseline_health - self.health)
 
-        # Small health bump if they go to hospital
+            # Mental recovers toward baseline
+            if self.mental < self.baseline_mental:
+                self.mental += params["mental_recovery_rate"] * (self.baseline_mental - self.mental)
+                self.mental += params["comfort_mental_recovery_bonus"] * (self.baseline_mental - self.mental)
+
+            # Small extra bump if they choose to go to hospital on a comfortable day
+            if go_hospital:
+                self.health = min(1.0, self.health + params["hospital_health_boost"])
+                self.mental = min(1.0, self.mental + params["hospital_mental_boost"])
+
+            # Clamp
+            self.health = max(0.0, min(1.0, self.health))
+            self.mental = max(0.0, min(1.0, self.mental))
+            return  # we are done for comfortable days
+
+        # ===== Hot / stressful day: compute heat stress =====
+        # Temperature-based stress factor
+        if env.temperature < heat_temp:
+            # slightly warm but not yet heatwave: small stress
+            temp_stress = (env.temperature - comfort_temp_max) / max(1e-6, (heat_temp - comfort_temp_max))
+            temp_stress = max(0.0, temp_stress)
+        else:
+            # base 1 at heat_temp, then ramp up more for extreme heat
+            if env.temperature <= extreme_temp:
+                temp_stress = 1.0 + 0.5 * ((env.temperature - heat_temp) / max(1e-6, (extreme_temp - heat_temp)))
+            else:
+                # beyond extreme_temp, increase more aggressively
+                temp_stress = 1.5 + 0.8 * (env.temperature - extreme_temp) / 10.0
+
+        # Humidity amplification only above 0.5
+        hum_excess = max(0.0, env.humidity - 0.5)
+        humidity_factor = 1.0 + params["humidity_heat_amplifier"] * hum_excess
+
+        # Exposure factor relative to typical outdoor hours
+        exposure_factor = outdoor_hours / max(1.0, self.outdoor_hours)
+
+        # Cooling & hospital mitigation
+        ac_factor = params["ac_heat_reduction_factor"] if use_ac else 1.0
+        hospital_factor = params["hospital_relief_factor"] if go_hospital else 1.0
+
+        # Worse if dehydrated (hydration_factor between 1 and 2)
+        hydration_factor = 1.0 + (1.0 - self.hydration)
+
+        heat_stress = (
+            temp_stress
+            * humidity_factor
+            * exposure_factor
+            * ac_factor
+            * hospital_factor
+            * hydration_factor
+        )
+
+        # ---------------- HEALTH DAMAGE & RECOVERY ----------------
+        age_factor = 0.5 + (self.age / 100.0)  # older people take more damage
+
+        # base physical damage from heat
+        health_damage = params["health_sensitivity"] * heat_stress * age_factor
+        health_damage = min(health_damage, params["max_daily_health_damage"])
+
+        # apply damage
+        self.health = max(0.0, self.health - health_damage)
+
+        # hospital can give a noticeable health bump
         if go_hospital:
-            self.health = min(1.0, self.health + 0.01)
+            self.health = min(1.0, self.health + params["hospital_health_boost"])
 
-        # Mental health damage: heat + isolation
+        # base recovery toward baseline (even on hot days, but weaker than damage if extreme)
+        if self.health < self.baseline_health:
+            self.health += params["health_recovery_rate"] * (self.baseline_health - self.health)
+
+        # clamp health
+        self.health = max(0.0, min(1.0, self.health))
+
+        # ---------------- MENTAL DAMAGE & RECOVERY ----------------
+        # Mental reacts to heat + isolation + being far below baseline.
+
+        # Isolation: if they stay inside *much* more than usual
         isolation_factor = 0.0
         if outdoor_hours < self.outdoor_hours * 0.5:
             isolation_factor = (self.outdoor_hours * 0.5 - outdoor_hours) / max(self.outdoor_hours, 0.1)
 
-        mental_damage = (
-            params["mental_sensitivity"] * effective_stress
-            + params["mental_isolation_weight"] * isolation_factor
-        )
-        self.mental = max(0.0, min(1.0, self.mental - mental_damage))
+        # heat impact on mental (weaker than physical)
+        mental_heat_damage = params["mental_heat_sensitivity"] * heat_stress
 
-        # Hospital mental relief
+        # isolation damage
+        mental_isolation_damage = params["mental_isolation_weight"] * isolation_factor
+
+        # Being in very poor physical health also affects mental, but not 1:1
+        health_gap = max(0.0, 0.5 - self.health)  # only when health < 0.5
+        mental_from_health = 0.5 * health_gap * params["mental_heat_sensitivity"]
+
+        mental_damage = mental_heat_damage + mental_isolation_damage + mental_from_health
+        mental_damage = min(mental_damage, params["max_daily_mental_damage"])
+
+        self.mental = max(0.0, self.mental - mental_damage)
+
+        # hospital also helps mental a bit
         if go_hospital:
             self.mental = min(1.0, self.mental + params["hospital_mental_boost"])
+
+        # --- Mental help from professional / gov when sanity is too low ---
+        if self.mental < params["mental_help_threshold"]:
+            # You can think of this as them deciding to seek help.
+            self.mental = min(1.0, self.mental + params["mental_help_boost"])
+
+        # base mental recovery toward baseline
+        if self.mental < self.baseline_mental:
+            self.mental += params["mental_recovery_rate"] * (self.baseline_mental - self.mental)
+
+        # clamp mental
+        self.mental = max(0.0, min(1.0, self.mental))

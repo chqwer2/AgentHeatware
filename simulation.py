@@ -8,6 +8,7 @@ from groups import Family, Company
 from llm_interfaces import (
     llm_weather_announcement,
     USE_REAL_LLM,
+    GLOBAL_LLM_ENABLED,
     build_personal_risk_prompt,
     call_llm_api,
     parse_personal_risk_response,
@@ -30,8 +31,19 @@ class Simulation:
     params: Dict[str, float]
     families: List[Family] = field(default_factory=list)
     companies: List[Company] = field(default_factory=list)
-    decision_mode: str = "rule"      # "rule" or "llm" per-agent (for direct decisions)
-    use_llm_weather: bool = True
+
+    # "rule" or "llm" for DIRECT per-agent decisions
+    # (but if use_llm=False, we will force "rule" internally)
+    decision_mode: str = "rule"
+
+    # SINGLE flag that controls ALL LLM features:
+    # - weather announcement
+    # - personal risk LLM
+    # - heat disease LLM
+    # - family/company LLM plans
+    # - (optional) per-agent LLM decisions if decision_mode="llm"
+    use_llm: bool = True
+
     ac_available_fraction: float = 0.5
     group_influence_prob: float = 0.6
     verbose: bool = True
@@ -43,8 +55,17 @@ class Simulation:
         agents_by_id = {a.id: a for a in self.agents}
         total_days = len(self.weather_series)
 
+        # Effective: we can only really use LLM if BOTH
+        # - Simulation.use_llm is True
+        # - llm_interfaces knows we have a real provider & global is enabled
+        effective_use_llm = self.use_llm and USE_REAL_LLM and GLOBAL_LLM_ENABLED
+
         if self.verbose:
-            print(f"[SIM] Starting simulation for {total_days} days, {len(self.agents)} agents.")
+            print(
+                f"[SIM] Starting simulation for {total_days} days, "
+                f"{len(self.agents)} agents. use_llm={self.use_llm}, "
+                f"effective_use_llm={effective_use_llm}"
+            )
 
         import random
         for day, (temp, hum) in enumerate(self.weather_series):
@@ -58,15 +79,19 @@ class Simulation:
                 ac_available=(random.random() < self.ac_available_fraction),
             )
 
-            # 1) Optional global weather broadcast (LLM or heuristic)
-            if self.use_llm_weather:
+            # 1) Optional global weather broadcast (ONLY if effective_use_llm)
+            if effective_use_llm:
                 _announcement = llm_weather_announcement(env)
 
             # 2) Family + company coordination -> group_plans
             group_plans: Dict[int, Dict[str, Any]] = {}
 
             for fam in self.families:
-                fam_plan = fam.plan_with_llm(agents_by_id, env)
+                if effective_use_llm:
+                    fam_plan = fam.plan_with_llm(agents_by_id, env)
+                else:
+                    fam_plan = fam.plan_rule_based(agents_by_id, env)
+
                 for aid, action in fam_plan.items():
                     if aid not in group_plans:
                         group_plans[aid] = {"action": action.copy(), "sources": ["family"]}
@@ -75,7 +100,11 @@ class Simulation:
                         group_plans[aid]["sources"].append("family")
 
             for comp in self.companies:
-                comp_plan = comp.plan_with_llm(agents_by_id, env)
+                if effective_use_llm:
+                    comp_plan = comp.plan_with_llm(agents_by_id, env)
+                else:
+                    comp_plan = comp.plan_rule_based(agents_by_id, env)
+
                 for aid, action in comp_plan.items():
                     if aid not in group_plans:
                         group_plans[aid] = {"action": action.copy(), "sources": ["company"]}
@@ -92,8 +121,8 @@ class Simulation:
                 personal_risk_hint = 1.0
                 personal_risk_info = None
 
-                # ---- personal risk via LLM (ALWAYS called if USE_REAL_LLM) ----
-                if USE_REAL_LLM:
+                # ---- personal risk via LLM (ONLY if effective_use_llm) ----
+                if effective_use_llm:
                     prompt = build_personal_risk_prompt(ag, env)
                     try:
                         text = call_llm_api(prompt, tag=f"personal_risk_agent_{ag.id}_day_{day}")
@@ -111,15 +140,21 @@ class Simulation:
                     except Exception as e:
                         print(f"[PERSONAL-LLM] Error for agent {ag.id} day {day}: {e}")
 
-                # Base action: LLM actions or rule-based
+                # ---- Base action: from personal risk LLM or rule-based ----
+                # If no personal_risk_info, fall back to agent.decide()
                 if personal_risk_info is not None:
                     base_action = personal_risk_info["actions"]
                     sickness_base_prob = personal_risk_info["sickness_base_probability"]
                 else:
+                    # If LLM is disabled, ALWAYS force rule-based decisions here
+                    decision_mode = self.decision_mode
+                    if not effective_use_llm:
+                        decision_mode = "rule"
+
                     base_action = ag.decide(
                         env,
                         self.params,
-                        mode=self.decision_mode,
+                        mode=decision_mode,
                         risk_hint=personal_risk_hint,
                     )
                     sickness_base_prob = 0.0
@@ -164,7 +199,7 @@ class Simulation:
                 final_outdoor_hours = float(final_action.get("target_outdoor_hours", ag.outdoor_hours))
 
                 if (
-                    USE_REAL_LLM
+                    effective_use_llm
                     and ag.heat_condition == "none"
                     and (ag.health < 0.5 or ag.mental < 0.5)
                 ):
